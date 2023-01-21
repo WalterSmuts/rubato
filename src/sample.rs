@@ -11,7 +11,7 @@ where
         + CoerceFrom<usize>
         + CoerceFrom<f64>
         + CoerceFrom<f32>
-        + realfft::FftNum
+        + easyfft::FftNum
         + std::ops::Mul
         + std::ops::Div
         + std::ops::Add
@@ -24,6 +24,7 @@ where
         + AvxSample
         + SseSample
         + NeonSample
+        + Default
         + Send,
 {
     const PI: Self;

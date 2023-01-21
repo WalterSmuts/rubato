@@ -1,28 +1,21 @@
 use crate::error::ResamplerConstructionError;
 use crate::sinc::make_sincs;
 use crate::windows::WindowFunction;
-use num_complex::Complex;
+use easyfft::prelude::*;
 use num_integer as integer;
-use num_traits::Zero;
-use std::sync::Arc;
 
 use crate::error::{ResampleError, ResampleResult};
 use crate::{update_mask_from_buffers, validate_buffers, Resampler, Sample};
-use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 /// A helper for resampling a single chunk of data.
 struct FftResampler<T> {
     fft_size_in: usize,
     fft_size_out: usize,
-    filter_f: Vec<Complex<T>>,
-    fft: Arc<dyn RealToComplex<T>>,
-    ifft: Arc<dyn ComplexToReal<T>>,
-    scratch_fw: Vec<Complex<T>>,
-    scratch_inv: Vec<Complex<T>>,
-    input_buf: Vec<T>,
-    input_f: Vec<Complex<T>>,
-    output_f: Vec<Complex<T>>,
-    output_buf: Vec<T>,
+    filter_f: DynRealDft<T>,
+    input_buf: Box<[T]>,
+    input_f: DynRealDft<T>,
+    output_f: DynRealDft<T>,
+    output_buf: Box<[T]>,
 }
 
 /// A synchronous resampler that needs a fixed number of audio frames for input
@@ -103,30 +96,20 @@ where
         );
         let sinc = make_sincs::<T>(fft_size_in, 1, cutoff, WindowFunction::BlackmanHarris2);
         let mut filter_t: Vec<T> = vec![T::zero(); 2 * fft_size_in];
-        let mut filter_f: Vec<Complex<T>> = vec![Complex::zero(); fft_size_in + 1];
         for (n, f) in filter_t.iter_mut().enumerate().take(fft_size_in) {
             *f = sinc[0][n] / T::coerce(2 * fft_size_in);
         }
 
-        let input_f: Vec<Complex<T>> = vec![Complex::zero(); fft_size_in + 1];
-        let input_buf: Vec<T> = vec![T::zero(); 2 * fft_size_in];
-        let output_f: Vec<Complex<T>> = vec![Complex::zero(); fft_size_out + 1];
-        let output_buf: Vec<T> = vec![T::zero(); 2 * fft_size_out];
-        let mut planner = RealFftPlanner::<T>::new();
-        let fft = planner.plan_fft_forward(2 * fft_size_in);
-        let ifft = planner.plan_fft_inverse(2 * fft_size_out);
-        fft.process(&mut filter_t, &mut filter_f).unwrap();
-        let scratch_fw = fft.make_scratch_vec();
-        let scratch_inv = ifft.make_scratch_vec();
+        let input_f = DynRealDft::default(fft_size_in * 2);
+        let input_buf = vec![T::zero(); 2 * fft_size_in].into();
+        let output_f = DynRealDft::default(fft_size_out * 2);
+        let output_buf = vec![T::zero(); 2 * fft_size_out].into();
+        let filter_f = filter_t.real_fft();
 
         FftResampler {
             fft_size_in,
             fft_size_out,
             filter_f,
-            fft,
-            ifft,
-            scratch_fw,
-            scratch_inv,
             input_buf,
             input_f,
             output_f,
@@ -148,36 +131,16 @@ where
         }
 
         // FFT and store result in history, update index
-        self.fft
-            .process_with_scratch(&mut self.input_buf, &mut self.input_f, &mut self.scratch_fw)
-            .unwrap();
-
-        let new_len = if self.fft_size_in < self.fft_size_out {
-            self.fft_size_in + 1
-        } else {
-            self.fft_size_out
-        };
+        self.input_buf.real_fft_using(&mut self.input_f);
 
         // multiply with filter FT
-        self.input_f
-            .iter_mut()
-            .take(new_len)
-            .zip(self.filter_f.iter())
-            .for_each(|(spec, filt)| *spec *= filt);
+        self.input_f *= &self.filter_f;
 
         // copy to modified spectrum
-        self.output_f[0..new_len].copy_from_slice(&self.input_f[0..new_len]);
-        for val in self.output_f[new_len..].iter_mut() {
-            *val = Complex::zero();
-        }
+        self.output_f.clone_from(&self.input_f);
+
         // IFFT result, store result and overlap
-        self.ifft
-            .process_with_scratch(
-                &mut self.output_f,
-                &mut self.output_buf,
-                &mut self.scratch_inv,
-            )
-            .unwrap();
+        self.output_f.real_ifft_using(&mut self.output_buf);
         for (n, item) in wave_out.iter_mut().enumerate().take(self.fft_size_out) {
             *item = self.output_buf[n] + overlap[n];
         }
